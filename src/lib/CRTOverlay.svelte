@@ -1,13 +1,14 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte'
-  import html2canvas from 'html2canvas'
+  import { createUIScene } from './UIScene'
+  import type { UIScene } from './UIScene'
   import { makeCRTNode } from './shader'
   import type { CRTFlags } from './shader'
   import {
     WebGPURenderer, MeshBasicNodeMaterial,
     Mesh, PlaneGeometry, Scene,
     OrthographicCamera, WebGLRenderTarget,
-    CanvasTexture, LinearFilter, Vector2, SRGBColorSpace
+    CanvasTexture, LinearFilter, NearestFilter, Vector2, SRGBColorSpace
   } from 'three/webgpu'
   import { uniform, texture as textureTSL, uv, vec2, float } from 'three/tsl'
   import type TextureNode from 'three/src/nodes/accessors/TextureNode.js'
@@ -15,8 +16,6 @@
   import type { Vector2 as Vector2Type } from 'three'
 
   let {
-    target = null,
-    fps = 20,
     // INTENSITY
     chromAb = 1.0,
     bleed = 1.0,
@@ -59,17 +58,22 @@
     triadRowShift = 0.0,
     rowBrickShift = 0.5,
     colBrickShift = 0.0,
-    dotRadius = 0.45,
     slotWeight = 0.8,
     slotExponent = 2.0,
     edgeSoftness = 0.15,
     triadPhase = 0.0,
-    maskLodStart = 1.0,
-    maskLodEnd = 2.0,
-    virtualWeight = 1.0,
+    // MASK TYPE & APERTURE GRILLE
+    maskType = 0.0,
+    stripePitch = 3.0,
+    stripeExponent = 1.5,
+    grillePurity = 0.7,
+    numDampingWires = 2.0,
+    wireWidth = 1.5,
+    wireStrength = 0.35,
+    // CONVERGENCE
+    convergenceR = 0.0,
+    convergenceB = 0.0,
   }: {
-    target?: HTMLElement | null
-    fps?: number
     chromAb?: number
     bleed?: number
     scanlines?: number
@@ -106,14 +110,19 @@
     triadRowShift?: number
     rowBrickShift?: number
     colBrickShift?: number
-    dotRadius?: number
     slotWeight?: number
     slotExponent?: number
     edgeSoftness?: number
     triadPhase?: number
-    maskLodStart?: number
-    maskLodEnd?: number
-    virtualWeight?: number
+    maskType?: number
+    stripePitch?: number
+    stripeExponent?: number
+    grillePurity?: number
+    numDampingWires?: number
+    wireWidth?: number
+    wireStrength?: number
+    convergenceR?: number
+    convergenceB?: number
   } = $props()
 
   let containerEl: HTMLDivElement
@@ -126,21 +135,17 @@
   let ghostTargets: WebGLRenderTarget[] = []
   let ghostTexUniform: TextureNode | undefined
   let srcTexture: CanvasTexture | undefined
-  let srcCanvas: HTMLCanvasElement | undefined
-  let srcCtx: CanvasRenderingContext2D | undefined
+  let uiScene: UIScene | undefined
   let resUniform: UniformNode<'vec2', Vector2Type> | undefined
   let dtUniform: UniformNode<'float', number> | undefined
   let timeUniform: UniformNode<'float', number> | undefined
+  let zoomUniform: UniformNode<'float', number> | undefined
   let readIdx: number = 0
 
   let W: number = 0, H: number = 0
-  let lastCapture: number = 0
   let lastFrame: number = 0
-  let capturedCanvas: HTMLCanvasElement | null = null
-  let capturing: boolean = false
 
   let flags = $state.raw<CRTFlags | undefined>(undefined)
-  let hoverStyleEl: HTMLStyleElement | null = null
 
   function resize(): void {
     W = window.innerWidth
@@ -157,29 +162,8 @@
         renderer.setRenderTarget(null)
       }
     }
-    if (srcCanvas) {
-      srcCanvas.width = W
-      srcCanvas.height = H
-    }
-  }
-
-  async function doCapture(): Promise<void> {
-    if (capturing) return
-    capturing = true
-    try {
-      const el = target || document.body
-      capturedCanvas = await html2canvas(el, {
-        scale: 1.0,
-        useCORS: false,
-        allowTaint: true,
-        backgroundColor: null,
-        logging: false,
-        ignoreElements: (el) => containerEl.contains(el) || (ignoreEl?.contains(el) ?? false),
-      })
-    } catch (e) {
-      console.warn('html2canvas error:', e)
-    }
-    capturing = false
+    uiScene?.resize(W, H)
+    if (srcTexture) srcTexture.needsUpdate = true
   }
 
   async function initThree(): Promise<void> {
@@ -225,18 +209,17 @@
     }
     renderer.setRenderTarget(null)
 
-    // fixed-size staging canvas — dimensions match html2canvas scale:1.0 output
-    // never swap .image, only drawImage into it so the GPU texture never reallocates
-    srcCanvas = document.createElement('canvas')
-    srcCanvas.width = W
-    srcCanvas.height = H
-    srcCtx = srcCanvas.getContext('2d')!
-    srcTexture = new CanvasTexture(srcCanvas)
+    // UIScene: immediate-mode retro terminal drawn to offscreen canvas each frame
+    uiScene = await createUIScene(W, H)
+    srcTexture = new CanvasTexture(uiScene.canvas)
+    srcTexture.minFilter = NearestFilter
+    srcTexture.magFilter = NearestFilter
     srcTexture.colorSpace = SRGBColorSpace
 
     resUniform = uniform(new Vector2(W, H))
     dtUniform = uniform(1 / 60)
     timeUniform = uniform(0)
+    zoomUniform = uniform(1.0)
     // GLSLNodeBuilder.isFlipY()=true auto-flips render target textures (y → 1-y) in the
     // shader. pre-invert Y so the double-flip cancels: 1-(1-y)=y → correct orientation.
     const preFlippedUV = vec2(uv().x, float(1.0).sub(uv().y))
@@ -284,18 +267,25 @@
       triadRowShift:   uniform(triadRowShift),
       rowBrickShift:   uniform(rowBrickShift),
       colBrickShift:   uniform(colBrickShift),
-      dotRadius:       uniform(dotRadius),
       slotWeight:      uniform(slotWeight),
       slotExponent:    uniform(slotExponent),
       edgeSoftness:    uniform(edgeSoftness),
       triadPhase:      uniform(triadPhase),
-      maskLodStart:    uniform(maskLodStart),
-      maskLodEnd:      uniform(maskLodEnd),
-      virtualWeight:   uniform(virtualWeight),
+      // MASK TYPE & APERTURE GRILLE
+      maskType:        uniform(maskType),
+      stripePitch:     uniform(stripePitch),
+      stripeExponent:  uniform(stripeExponent),
+      grillePurity:    uniform(grillePurity),
+      numDampingWires: uniform(numDampingWires),
+      wireWidth:       uniform(wireWidth),
+      wireStrength:    uniform(wireStrength),
+      // CONVERGENCE
+      convergenceR:    uniform(convergenceR),
+      convergenceB:    uniform(convergenceB),
     }
 
     material = new MeshBasicNodeMaterial()
-    material.colorNode = makeCRTNode(srcTexture, ghostTexUniform, resUniform, dtUniform, timeUniform, flags)
+    material.colorNode = makeCRTNode(srcTexture, ghostTexUniform, resUniform, dtUniform, timeUniform, zoomUniform, flags)
     scene.add(new Mesh(new PlaneGeometry(2, 2), material))
 
     // Passthrough scene: just blits the ghost write target to screen.
@@ -316,16 +306,9 @@
       timeUniform!.value = now / 1000
       lastFrame = now
 
-      if (now - lastCapture > 1000 / fps) {
-        lastCapture = now
-        doCapture()
-      }
-
-      if (capturedCanvas) {
-        srcCtx!.drawImage(capturedCanvas, 0, 0, srcCanvas!.width, srcCanvas!.height)
-        srcTexture!.needsUpdate = true
-        capturedCanvas = null  // consumed — skip re-upload until next capture arrives
-      }
+      zoomUniform!.value = uiScene!.zoom
+      uiScene!.draw(now / 1000)
+      srcTexture!.needsUpdate = true
 
       const writeIdx = 1 - readIdx
       ghostTexUniform!.value = ghostTargets[readIdx].texture
@@ -380,80 +363,44 @@
     flags.triadRowShift.value   = triadRowShift
     flags.rowBrickShift.value   = rowBrickShift
     flags.colBrickShift.value   = colBrickShift
-    flags.dotRadius.value       = dotRadius
     flags.slotWeight.value      = slotWeight
     flags.slotExponent.value    = slotExponent
     flags.edgeSoftness.value    = edgeSoftness
     flags.triadPhase.value      = triadPhase
-    flags.maskLodStart.value    = maskLodStart
-    flags.maskLodEnd.value      = maskLodEnd
-    flags.virtualWeight.value   = virtualWeight
+    flags.maskType.value        = maskType
+    flags.stripePitch.value     = stripePitch
+    flags.stripeExponent.value  = stripeExponent
+    flags.grillePurity.value    = grillePurity
+    flags.numDampingWires.value = numDampingWires
+    flags.wireWidth.value       = wireWidth
+    flags.wireStrength.value    = wireStrength
+    flags.convergenceR.value    = convergenceR
+    flags.convergenceB.value    = convergenceB
   })
 
-  // Scan document stylesheets and inject equivalent rules using plain classes
-  // instead of pseudo-classes, since html2canvas clones the DOM and pseudo-class
-  // states (:hover, :active) don't transfer to the clone.
-  function buildHoverStyles(): void {
-    const rules: string[] = []
-    for (const sheet of document.styleSheets) {
-      try {
-        for (const rule of sheet.cssRules) {
-          if (!(rule instanceof CSSStyleRule)) continue
-          if (rule.selectorText.includes(':hover'))
-            rules.push(rule.cssText.replace(/:hover/g, '.crt-hover'))
-          if (rule.selectorText.includes(':active'))
-            rules.push(rule.cssText.replace(/:active/g, '.crt-active'))
-        }
-      } catch {} // cross-origin sheets are not readable
+  const _onWheel = (e: WheelEvent) => {
+    if (!ignoreEl?.contains(e.target as Node)) {
+      uiScene?.onWheel(e.deltaY)
+      e.preventDefault()
     }
-    hoverStyleEl?.remove()
-    hoverStyleEl = document.createElement('style')
-    hoverStyleEl.textContent = rules.join('\n')
-    document.head.appendChild(hoverStyleEl)
   }
-
-  // Walk up the DOM from the hovered element, applying crt-hover to each
-  // ancestor so parent:hover .child rules also work correctly.
-  function onHover(e: Event): void {
-    document.querySelectorAll('.crt-hover').forEach(el => el.classList.remove('crt-hover'))
-    let el: Element | null = e.target as Element
-    while (el && el !== document.documentElement) {
-      if (!containerEl?.contains(el) && !(ignoreEl?.contains(el)))
-        el.classList.add('crt-hover')
-      el = el.parentElement
+  const toCanvasX = (sx: number) => { const z = uiScene?.zoom ?? 1; return ((sx / W - 0.5) / z + 0.5) * W }
+  const toCanvasY = (sy: number) => { const z = uiScene?.zoom ?? 1; return ((sy / H - 0.5) / z + 0.5) * H }
+  const _onMouseMove = (e: MouseEvent) => uiScene?.onMouseMove(toCanvasX(e.clientX), toCanvasY(e.clientY))
+  const _onMouseDown = (e: MouseEvent) => {
+    if (!ignoreEl?.contains(e.target as Node)) {
+      uiScene?.onMouseDown(toCanvasX(e.clientX), toCanvasY(e.clientY))
+      e.preventDefault()  // prevent text selection during window drag
     }
-    if (!capturing) doCapture()
   }
-
-  function offHover(): void {
-    document.querySelectorAll('.crt-hover').forEach(el => el.classList.remove('crt-hover'))
-  }
-
-  function onActive(e: Event): void {
-    ;(e.target as Element)?.classList.add('crt-active')
-    if (!capturing) doCapture()
-  }
-
-  function offActive(): void {
-    document.querySelectorAll('.crt-active').forEach(el => el.classList.remove('crt-active'))
-    if (!capturing) doCapture()
-  }
-
-  // fire an extra capture immediately on other interactions (scroll, focus, etc.)
-  function interactionCapture(): void {
-    if (!capturing) doCapture()
-  }
-
-  const INTERACTION_EVENTS = ['mousemove', 'focusin', 'focusout', 'scroll'] as const
+  const _onMouseUp = () => uiScene?.onMouseUp()
 
   onMount(() => {
     window.addEventListener('resize', resize)
-    INTERACTION_EVENTS.forEach(e => document.addEventListener(e, interactionCapture, { passive: true }))
-    document.addEventListener('mouseover',  onHover,  { passive: true })
-    document.addEventListener('mouseleave', offHover, { passive: true })
-    document.addEventListener('mousedown',  onActive, { passive: true })
-    document.addEventListener('mouseup',    offActive, { passive: true })
-    buildHoverStyles()
+    document.addEventListener('mousemove', _onMouseMove, { passive: true })
+    document.addEventListener('mousedown', _onMouseDown)
+    document.addEventListener('mouseup',   _onMouseUp,   { passive: true })
+    document.addEventListener('wheel',     _onWheel,     { passive: false })
     initThree()
   })
 
@@ -471,15 +418,10 @@
       })
     })
     window.removeEventListener('resize', resize)
-    INTERACTION_EVENTS.forEach(e => document.removeEventListener(e, interactionCapture))
-    document.removeEventListener('mouseover',  onHover)
-    document.removeEventListener('mouseleave', offHover)
-    document.removeEventListener('mousedown',  onActive)
-    document.removeEventListener('mouseup',    offActive)
-    document.querySelectorAll('.crt-hover, .crt-active').forEach(
-      el => el.classList.remove('crt-hover', 'crt-active')
-    )
-    hoverStyleEl?.remove()
+    document.removeEventListener('mousemove', _onMouseMove)
+    document.removeEventListener('mousedown', _onMouseDown)
+    document.removeEventListener('mouseup',   _onMouseUp)
+    document.removeEventListener('wheel',     _onWheel)
   })
 </script>
 

@@ -35,14 +35,21 @@
     triadRowShift  = $bindable(0.0),
     rowBrickShift  = $bindable(0.5),
     colBrickShift  = $bindable(0.0),
-    dotRadius      = $bindable(0.45),
     slotWeight     = $bindable(0.8),
     slotExponent   = $bindable(2.0),
     edgeSoftness   = $bindable(0.15),
     triadPhase     = $bindable(0.0),
-    maskLodStart   = $bindable(1.0),
-    maskLodEnd     = $bindable(2.0),
-    virtualWeight  = $bindable(1.0),
+    // MASK TYPE & APERTURE GRILLE
+    maskType       = $bindable(0.0),
+    stripePitch    = $bindable(3.0),
+    stripeExponent = $bindable(1.5),
+    grillePurity   = $bindable(0.7),
+    numDampingWires = $bindable(2.0),
+    wireWidth      = $bindable(1.5),
+    wireStrength   = $bindable(0.35),
+    // CONVERGENCE
+    convergenceR   = $bindable(0.0),
+    convergenceB   = $bindable(0.0),
     // OPTICS
     caOffset       = $bindable(0.004),
     caVertical     = $bindable(0.0),
@@ -81,14 +88,19 @@
     triadRowShift?:  number
     rowBrickShift?:  number
     colBrickShift?:  number
-    dotRadius?:      number
     slotWeight?:     number
     slotExponent?:   number
     edgeSoftness?:   number
     triadPhase?:     number
-    maskLodStart?:   number
-    maskLodEnd?:     number
-    virtualWeight?:  number
+    maskType?:       number
+    stripePitch?:    number
+    stripeExponent?: number
+    grillePurity?:   number
+    numDampingWires?: number
+    wireWidth?:      number
+    wireStrength?:   number
+    convergenceR?:   number
+    convergenceB?:   number
     caOffset?:       number
     caVertical?:     number
     bleedKernel?:    number
@@ -272,11 +284,6 @@
         <span class="val">{colBrickShift.toFixed(2)}</span>
       </label>
       <label>
-        <span class="lbl">dot-radius</span>
-        <input type="range" min="0.1" max="0.9" step="0.01" bind:value={dotRadius} />
-        <span class="val">{dotRadius.toFixed(2)}</span>
-      </label>
-      <label>
         <span class="lbl">slot-weight</span>
         <input type="range" min="0" max="1" step="0.01" bind:value={slotWeight} />
         <span class="val">{slotWeight.toFixed(2)}</span>
@@ -297,19 +304,49 @@
         <span class="val">{triadPhase.toFixed(2)}</span>
       </label>
       <label>
-        <span class="lbl">lod-start</span>
-        <input type="range" min="0.5" max="4" step="0.25" bind:value={maskLodStart} />
-        <span class="val">{maskLodStart.toFixed(2)}</span>
+        <span class="lbl">mask-type</span>
+        <input type="range" min="0" max="1" step="0.01" bind:value={maskType} />
+        <span class="val">{maskType.toFixed(2)}</span>
       </label>
       <label>
-        <span class="lbl">lod-end</span>
-        <input type="range" min="1" max="6" step="0.25" bind:value={maskLodEnd} />
-        <span class="val">{maskLodEnd.toFixed(2)}</span>
+        <span class="lbl">stripe-pitch</span>
+        <input type="range" min="1" max="12" step="0.25" bind:value={stripePitch} />
+        <span class="val">{stripePitch.toFixed(2)}</span>
       </label>
       <label>
-        <span class="lbl">virtual-wt</span>
-        <input type="range" min="0" max="2" step="0.01" bind:value={virtualWeight} />
-        <span class="val">{virtualWeight.toFixed(2)}</span>
+        <span class="lbl">stripe-exp</span>
+        <input type="range" min="0.5" max="8" step="0.1" bind:value={stripeExponent} />
+        <span class="val">{stripeExponent.toFixed(1)}</span>
+      </label>
+      <label>
+        <span class="lbl">grille-pur</span>
+        <input type="range" min="0" max="1" step="0.01" bind:value={grillePurity} />
+        <span class="val">{grillePurity.toFixed(2)}</span>
+      </label>
+      <label>
+        <span class="lbl">damp-wires</span>
+        <input type="range" min="0" max="8" step="1" bind:value={numDampingWires} />
+        <span class="val">{numDampingWires.toFixed(0)}</span>
+      </label>
+      <label>
+        <span class="lbl">wire-width</span>
+        <input type="range" min="0" max="6" step="0.1" bind:value={wireWidth} />
+        <span class="val">{wireWidth.toFixed(1)}</span>
+      </label>
+      <label>
+        <span class="lbl">wire-str</span>
+        <input type="range" min="0" max="0.8" step="0.01" bind:value={wireStrength} />
+        <span class="val">{wireStrength.toFixed(2)}</span>
+      </label>
+      <label>
+        <span class="lbl">conv-r</span>
+        <input type="range" min="-2" max="2" step="0.05" bind:value={convergenceR} />
+        <span class="val">{convergenceR.toFixed(2)}</span>
+      </label>
+      <label>
+        <span class="lbl">conv-b</span>
+        <input type="range" min="-2" max="2" step="0.05" bind:value={convergenceB} />
+        <span class="val">{convergenceB.toFixed(2)}</span>
       </label>
     </div>
 

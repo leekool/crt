@@ -2,9 +2,9 @@ import {
   Fn, vec2, vec3, vec4, float,
   texture, uv,
   sin, cos, pow, mix, clamp, mod, abs, max, dot, select, length,
-  exp, fract, floor, smoothstep
+  exp, fract, floor, smoothstep, fwidth
 } from 'three/tsl'
-import type { CanvasTexture, Vector2 } from 'three'
+import type { Texture, Vector2 } from 'three'
 import type TextureNode from 'three/src/nodes/accessors/TextureNode.js'
 import type UniformNode from 'three/src/nodes/core/UniformNode.js'
 
@@ -55,22 +55,30 @@ export type CRTFlags = {
   triadRowShift:   UniformNode<'float', number>  // per-row H shift,    default 0.0
   rowBrickShift:   UniformNode<'float', number>  // alt-row H offset,   default 0.5
   colBrickShift:   UniformNode<'float', number>  // alt-col V offset,   default 0.0
-  dotRadius:       UniformNode<'float', number>  // dot half-width,     default 0.45
   slotWeight:      UniformNode<'float', number>  // V slot depth,       default 0.8
   slotExponent:    UniformNode<'float', number>  // profile sharpness,  default 2.0
   edgeSoftness:    UniformNode<'float', number>  // slot edge blend,    default 0.15
   triadPhase:      UniformNode<'float', number>  // H phase offset,     default 0.0
-  maskLodStart:    UniformNode<'float', number>  // LOD lower px/triad, default 1.0
-  maskLodEnd:      UniformNode<'float', number>  // LOD upper px/triad, default 2.0
-  virtualWeight:   UniformNode<'float', number>  // LOD scale,          default 1.0
+  // MASK TYPE & APERTURE GRILLE
+  maskType:        UniformNode<'float', number>  // 0=shadow 1=aperture,default 0.0
+  stripePitch:     UniformNode<'float', number>  // AG stripe period px,default 3.0
+  stripeExponent:  UniformNode<'float', number>  // cosine sharpness,   default 1.5
+  grillePurity:    UniformNode<'float', number>  // AG mask contrast,   default 0.7
+  numDampingWires: UniformNode<'float', number>  // horizontal wires,   default 2.0
+  wireWidth:       UniformNode<'float', number>  // wire half-w maskPx, default 1.5
+  wireStrength:    UniformNode<'float', number>  // wire darkness,      default 0.35
+  // CONVERGENCE
+  convergenceR:    UniformNode<'float', number>  // R X shift maskPx,   default 0.0
+  convergenceB:    UniformNode<'float', number>  // B X shift maskPx,   default 0.0
 }
 
 export const makeCRTNode = (
-  srcTex:          CanvasTexture,
+  srcTex:          Texture,
   ghostTexUniform: TextureNode,
   resUniform:      UniformNode<'vec2', Vector2>,
   dtUniform:       UniformNode<'float', number>,
   timeUniform:     UniformNode<'float', number>,  // auto-managed: performance.now()/1000
+  zoom:            UniformNode<'float', number>,  // from UIScene.winScale each frame
   flags:           CRTFlags
 ) => Fn(() => {
   const uvNode = uv()
@@ -83,79 +91,98 @@ export const makeCRTNode = (
   const barrelK = flags.barrel.mul(float(0.15))
   const warpedUV = center.mul(float(1.0).add(r2.mul(barrelK))).add(vec2(0.5)).toVar('warpedUV')
 
+  // Zoom source UV from screen centre: at zoom>1 each source pixel appears as an NxN block.
+  // warpedUV is kept for screen-space effects (mask, vignette, scanlines, edge mask, wires).
+  const srcBase = warpedUV.sub(vec2(0.5)).div(zoom).add(vec2(0.5)).toVar('srcBase')
+
   // 2. Chromatic aberration — radial + vertical
   const caRadius = length(warpedUV.sub(vec2(0.5)))
   const ca  = flags.caOffset.mul(caRadius)
   const caV = flags.caVertical.mul(caRadius)
   const caFull = vec3(
-    texture(srcTex, warpedUV.add(vec2(ca,  caV))).r,  // R: right+down
-    texture(srcTex, warpedUV).g,                       // G: no shift
-    texture(srcTex, warpedUV.sub(vec2(ca,  caV))).b   // B: left+up
+    texture(srcTex, srcBase.add(vec2(ca,  caV))).r,  // R: right+down
+    texture(srcTex, srcBase).g,                       // G: no shift
+    texture(srcTex, srcBase.sub(vec2(ca,  caV))).b   // B: left+up
   )
-  const caBypass = texture(srcTex, warpedUV).rgb
+  const caBypass = texture(srcTex, srcBase).rgb
   const col = mix(caBypass, caFull, flags.chromAb).toVar('col')
 
   // 3. Color bleed
   const bd = flags.bleedKernel
   const px = float(1.0).div(resX)
+  const pxZ = px.div(zoom)
   const bleedSum = col
-    .add(texture(srcTex, warpedUV.add(vec2(px, 0.0))).rgb.mul(bd))
-    .add(texture(srcTex, warpedUV.add(vec2(px.mul(float(2.0)), 0.0))).rgb.mul(bd).mul(0.5))
-    .add(texture(srcTex, warpedUV.sub(vec2(px, 0.0))).rgb.mul(bd).mul(0.3))
+    .add(texture(srcTex, srcBase.add(vec2(pxZ, 0.0))).rgb.mul(bd))
+    .add(texture(srcTex, srcBase.add(vec2(pxZ.mul(float(2.0)), 0.0))).rgb.mul(bd).mul(0.5))
+    .add(texture(srcTex, srcBase.sub(vec2(pxZ, 0.0))).rgb.mul(bd).mul(0.3))
   const bleedEffect = mix(col, bleedSum.div(float(1.0 + 0.25 * (0.5 + 0.3) + 0.25)), 0.6)
   col.assign(mix(col, bleedEffect, flags.bleed))
 
-  // 4. Shadow mask — full triad/slot system
-  // triadPitchX=3.0 ≡ old maskScale=1.0 (mod(uv.x * resX * 3 / triadPitchX, 3))
-  const TX = mod(warpedUV.x.mul(resX), flags.triadPitchX)
-  const TY = mod(warpedUV.y.mul(resY), flags.triadPitchY)
+  // 4. Shadow mask + Aperture grille — zoom-aware, analytic fwidth LOD
+  // CRT surface coordinates: centered at screen center (zoom origin is stable)
+  const maskX = warpedUV.x.sub(float(0.5)).mul(resX).div(zoom)
+  const maskY = warpedUV.y.sub(float(0.5)).mul(resY).div(zoom)
 
-  const rowIdx = floor(warpedUV.y.mul(resY).div(flags.triadPitchY))
-  const colIdx = floor(warpedUV.x.mul(resX).div(flags.triadPitchX))
+  // Analytic LOD: screen pixels per mask period via derivative
+  const dMaskX  = fwidth(maskX)
+  const maskT   = clamp(flags.maskType, float(0.0), float(1.0))
+  const activePitch  = mix(flags.triadPitchX, flags.stripePitch, maskT)
+  const screenPeriod = activePitch.div(dMaskX.add(float(0.0001)))
+  const maskVis      = smoothstep(float(1.0), float(3.0), screenPeriod)
 
+  const rowIdx  = floor(maskY.div(flags.triadPitchY))
+  const colIdx  = floor(maskX.div(flags.triadPitchX))
   // triadRowShift: per-row cumulative H shift (diagonal pattern, 0=none)
-  // rowBrickShift: alternating-row H shift (brick/honeycomb, 0.5=typical shadow mask)
+  // rowBrickShift: alternating-row H shift (brick/honeycomb, 0.5=typical)
   // colBrickShift: alternating-col V shift
   const txShift = rowIdx.mul(flags.triadRowShift).mul(flags.triadPitchX)
                .add(mod(rowIdx, float(2.0)).mul(flags.rowBrickShift).mul(flags.triadPitchX))
   const tyShift = mod(colIdx, float(2.0)).mul(flags.colBrickShift).mul(flags.triadPitchY)
+  // Per-channel TX for convergence: R and B shifted independently in maskPx
+  const TXr = mod(maskX.add(flags.convergenceR).add(txShift), flags.triadPitchX)
+  const TXg = mod(maskX.add(txShift),                         flags.triadPitchX)
+  const TXb = mod(maskX.add(flags.convergenceB).add(txShift), flags.triadPitchX)
+  const TY  = mod(maskY.add(tyShift), flags.triadPitchY)
 
-  const TXs = mod(TX.add(txShift), flags.triadPitchX)
-  const TYs = mod(TY.add(tyShift), flags.triadPitchY)
+  const TWO_PI_3   = float(Math.PI * 2.0 / 3.0)
+  const phosphorExp = flags.slotExponent.mul(float(0.5))
+  const toFrac = (TX: any) =>
+    TX.mul(float(3.0)).div(flags.triadPitchX).add(flags.triadPhase.mul(float(3.0)))
+  const phosR = pow(max(cos(toFrac(TXr).mul(TWO_PI_3)),                   float(0.0)), phosphorExp)
+  const phosG = pow(max(cos(toFrac(TXg).sub(float(1.0)).mul(TWO_PI_3)),   float(0.0)), phosphorExp)
+  const phosB = pow(max(cos(toFrac(TXb).sub(float(2.0)).mul(TWO_PI_3)),   float(0.0)), phosphorExp)
 
-  // horizontal: fracX in [0,3) over one R-G-B triad
-  const fracX = TXs.mul(float(3.0)).div(flags.triadPitchX).add(flags.triadPhase.mul(float(3.0)))
-  const TWO_PI_3 = float(Math.PI * 2.0 / 3.0)
+  // vertical slot: open region centred at 0.5 of TY/triadPitchY
+  const slotFrac   = TY.div(flags.triadPitchY)
+  const halfSlot   = flags.slotPixelPitch.div(flags.triadPitchY).mul(float(0.5))
+  const slotDist   = slotFrac.sub(float(0.5)).abs()
+  const slotOpen   = float(1.0).sub(
+    smoothstep(halfSlot, halfSlot.add(flags.edgeSoftness), slotDist))
+  const vertProf   = float(1.0).sub(flags.slotWeight.mul(float(1.0).sub(slotOpen)))
+  const shadowMask  = vec3(phosR, phosG, phosB).mul(vertProf)
+  const shadowBlend = mix(vec3(1.0), shadowMask, flags.maskPurity)
 
-  // cosine phosphor profile, slotExponent sharpens the peak
-  const phosRraw = max(cos(fracX.mul(TWO_PI_3)), float(0.0))
-  const phosGraw = max(cos(fracX.sub(float(1.0)).mul(TWO_PI_3)), float(0.0))
-  const phosBraw = max(cos(fracX.sub(float(2.0)).mul(TWO_PI_3)), float(0.0))
-  const exp_h = flags.slotExponent.mul(float(0.5))  // half-exponent on each cos
-  const phosR = pow(phosRraw, exp_h)
-  const phosG = pow(phosGraw, exp_h)
-  const phosB = pow(phosBraw, exp_h)
+  const fracS  = mod(maskX, flags.stripePitch).div(flags.stripePitch)  // [0,1)
+  const TWO_PI = float(Math.PI * 2.0)
+  const agR    = pow(max(cos(fracS.mul(TWO_PI)),                              float(0.0)), flags.stripeExponent)
+  const agG    = pow(max(cos(fracS.sub(float(1.0 / 3.0)).mul(TWO_PI)),       float(0.0)), flags.stripeExponent)
+  const agB    = pow(max(cos(fracS.sub(float(2.0 / 3.0)).mul(TWO_PI)),       float(0.0)), flags.stripeExponent)
+  const agRaw  = vec3(agR, agG, agB)
+  const agLum  = dot(agRaw, vec3(0.2126, 0.7152, 0.0722))
+  const agNorm = agRaw.div(max(agLum.mul(float(3.0)), float(0.001)))
+  const apertureBlend = mix(vec3(1.0), agNorm, flags.grillePurity)
 
-  // vertical slot: open region centred at 0.5 of TYs/triadPitchY
-  const slotFrac = TYs.div(flags.triadPitchY)       // [0,1)
-  const halfSlot = flags.slotPixelPitch.div(flags.triadPitchY).mul(float(0.5))
-  const edgeW    = flags.edgeSoftness
-  const slotDist = slotFrac.sub(float(0.5)).abs()
-  // smoothstep: 1=open, 0=closed, transitions over edgeSoftness
-  const slotOpen = float(1.0).sub(smoothstep(halfSlot, halfSlot.add(edgeW), slotDist))
-  const vertProf = float(1.0).sub(flags.slotWeight.mul(float(1.0).sub(slotOpen)))
+  // Damping wires: thin horizontal dark bands (characteristic of Trinitron AG)
+  const wirePhase  = fract(warpedUV.y.mul(flags.numDampingWires))
+  const wireDist   = wirePhase.sub(float(0.5)).abs()
+  // wireWidth is in maskPx; convert to wireDist units: wireWidth*zoom*numWires/resY
+  const wireEdge   = flags.wireWidth.mul(zoom).mul(flags.numDampingWires).div(resY)
+  const wireMask   = float(1.0).sub(
+    smoothstep(float(0.0), max(wireEdge, float(0.001)), wireDist))
+  const wireFactor = float(1.0).sub(flags.wireStrength.mul(wireMask))
 
-  // combine + maskPurity
-  const mask      = vec3(phosR, phosG, phosB).mul(vertProf)
-  const maskBlend = mix(vec3(1.0), mask, flags.maskPurity)
-
-  // LOD: mask visible only when triad is physically large enough
-  // smoothstep(start, end, x): 0 when x≤start, 1 when x≥end
-  // at default triadPitchX=3, start=1, end=2 → lodFactor=1.0 (full mask)
-  // at triadPitchX=1 (very dense) → lodFactor=0.0 (mask fades away)
-  const lodFactor = smoothstep(flags.maskLodStart, flags.maskLodEnd, flags.triadPitchX)
-                     .mul(flags.virtualWeight)
-  col.mulAssign(mix(vec3(1.0), maskBlend, lodFactor.mul(flags.shadowmask)))
+  const maskBlend = mix(shadowBlend, apertureBlend, maskT)
+  col.mulAssign(mix(vec3(1.0), maskBlend.mul(wireFactor), maskVis.mul(flags.shadowmask)))
 
   // 5. Bloom PSF — soft knee + 3-component gaussian
   // soft knee: quadratic ease-in through the threshold
@@ -176,7 +203,7 @@ export const makeCRTNode = (
     for (let i = -3; i <= 3; i++) {
       const d = float(i).mul(sp)
       const w = exp(d.mul(d).negate().div(float(2.0).mul(sigma.mul(sigma))))
-      blur.addAssign(sampleKnee(warpedUV.add(vec2(d.mul(pxW), 0.0))).mul(w))
+      blur.addAssign(sampleKnee(srcBase.add(vec2(d.mul(pxW).div(zoom), 0.0))).mul(w))
       wSum.addAssign(w)
     }
     blur.divAssign(wSum)
@@ -200,7 +227,7 @@ export const makeCRTNode = (
   for (const i of [-2, -1, 0, 1, 2]) {
     const d = float(i).mul(spHal)
     const w = exp(d.mul(d).negate().div(float(2.0).mul(sigHal.mul(sigHal))))
-    halBlur.addAssign(texture(srcTex, warpedUV.add(vec2(d.mul(pxW), 0.0))).rgb.mul(w))
+    halBlur.addAssign(texture(srcTex, srcBase.add(vec2(d.mul(pxW).div(zoom), 0.0))).rgb.mul(w))
     halWSum.addAssign(w)
   }
   halBlur.divAssign(halWSum)
